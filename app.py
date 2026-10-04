@@ -4,6 +4,7 @@ Lancer : streamlit run app.py
 Dépendances : pip install streamlit yfinance pandas numpy plotly requests
 """
 import hmac
+import os
 
 import numpy as np
 import pandas as pd
@@ -264,6 +265,11 @@ def decision_table() -> pd.DataFrame:
             rsi_now = float(rsi(close).iloc[-1])
             mm50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float("nan")
             mm200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
+            pru = pos.get("pru")
+            if pru and pru > 0:  # PV latente exacte si le prix de revient est renseigné
+                pv = unit_price_eur(line) / pru - 1
+            else:  # proxy : performance sur la fenêtre d'historique (~2 ans)
+                pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")
         except Exception:
             continue
         rows.append({
@@ -276,8 +282,57 @@ def decision_table() -> pd.DataFrame:
             "MM50": mm50,
             "MM200": mm200,
             "Tendance": trend_signal(price, mm200),
+            "PV latente": pv,
         })
     return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Alertes Telegram
+# ----------------------------------------------------------------------------
+def _telegram_config() -> tuple[str | None, str | None]:
+    """Jeton et chat_id Telegram, lus depuis st.secrets puis les variables d'environnement."""
+    token = chat_id = None
+    try:
+        token = st.secrets.get("TELEGRAM_TOKEN")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
+    except Exception:
+        pass
+    token = token or os.environ.get("TELEGRAM_TOKEN")
+    chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    return token, chat_id
+
+
+def send_telegram_alert(message: str) -> tuple[bool, str]:
+    """Envoie `message` via l'API Bot Telegram. Retourne (succès, détail)."""
+    token, chat_id = _telegram_config()
+    if not token or not chat_id:
+        return False, ("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID non configurés "
+                       "(st.secrets ou variables d'environnement).")
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True, "Alerte Telegram envoyée ✅"
+    except Exception as e:
+        return False, f"Échec de l'envoi Telegram : {e}"
+
+
+def rsi_alerts(deci: pd.DataFrame) -> list:
+    """Alertes RSI sur les lignes détenues : opportunité (RSI < 35) ou surachat (RSI > 75)."""
+    msgs = []
+    if deci is None or deci.empty:
+        return msgs
+    for _, r in deci.iterrows():
+        val = r["RSI(14)"]
+        if val < 35:
+            msgs.append(f"🟢 {r['Ligne']} ({r['Ticker']}) — Opportunité : RSI {val:.0f} (< 35)")
+        elif val > 75:
+            msgs.append(f"🔴 {r['Ligne']} ({r['Ticker']}) — Surachat : RSI {val:.0f} (> 75)")
+    return msgs
 
 
 # ----------------------------------------------------------------------------
@@ -417,6 +472,12 @@ with st.sidebar:
         targets = {n: st.number_input(f"Cible {n}", 0, 100, DEFAULT_TARGETS[n], step=5) for n in PEA_LINES}
         st.form_submit_button("Mettre à jour", use_container_width=True)
 
+    st.divider()
+    st.subheader("📩 Alertes Telegram")
+    if st.button("📩 Tester l'envoi d'une alerte Telegram", use_container_width=True):
+        ok, detail = send_telegram_alert("✅ Test d'alerte — Scanner d'opportunités & allocation.")
+        (st.success if ok else st.error)(detail)
+
 core_env = budget * core_pct / 100
 opp_env = budget - core_env
 
@@ -429,8 +490,8 @@ c1.metric("Budget du mois", f"{budget:,.0f} €")
 c2.metric("Enveloppe Cœur PEA", f"{core_env:,.0f} €", f"{core_pct}%")
 c3.metric("Enveloppe Opportunités", f"{opp_env:,.0f} €", f"{100 - core_pct}%")
 
-tab_core, tab_scan, tab_opp, tab_decision = st.tabs(
-    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision"])
+tab_core, tab_scan, tab_opp, tab_decision, tab_bilan = st.tabs(
+    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision", "🧾 Bilan & Fiscalité"])
 
 with tab_core:
     if sum(targets.values()) == 0:
@@ -470,6 +531,35 @@ with tab_decision:
         st.caption("RSI < 30 : survente (opportunité) · > 70 : surachat (attention) · "
                    "Tendance selon la position du prix vs MM200. "
                    "Prix/MM des cryptos exprimés en USD (signaux inchangés).")
+
+    st.divider()
+
+    # --- Module : Prise de profit & Sécurisation ---
+    st.subheader("🛡️ Prise de profit & Sécurisation")
+    if deci.empty:
+        st.info("Pas de données disponibles pour l'analyse de prise de profit.")
+    else:
+        overheated = pd.Series(
+            np.where(deci["Univers"] == "Crypto", deci["RSI(14)"] > 75, deci["RSI(14)"] > 70),
+            index=deci.index)
+        secure = deci[(deci["PV latente"] > 0.30) & overheated]
+        if secure.empty:
+            st.success("Aucune ligne à sécuriser (critère : PV latente > +30 % ET RSI en surchauffe — "
+                       "> 70 pour les ETF, > 75 pour les cryptos).")
+        else:
+            for _, r in secure.iterrows():
+                st.warning(
+                    f"**{r['Ligne']}** — PV latente {r['PV latente']:+.0%}, RSI {r['RSI(14)']:.0f}\n\n"
+                    "💡 Prise de profit recommandée : Envisager de sécuriser 10% à 20% de cette "
+                    "position pour réinvestir vers le Cœur PEA (MEUD.PA / PAEEM.PA).")
+            st.dataframe(
+                secure[["Univers", "Ligne", "Ticker", "Prix", "PV latente", "RSI(14)"]].style.format(
+                    {"Prix": "{:,.2f}", "PV latente": "{:+.1%}", "RSI(14)": "{:.1f}"}),
+                hide_index=True, use_container_width=True,
+            )
+        st.caption("Critère : plus-value latente > +30 % ET RSI en surchauffe (ETF > 70, Crypto > 75). "
+                   "PV latente via le PRU si renseigné dans POSITIONS, sinon via la performance de la "
+                   "fenêtre d'historique (~2 ans).")
 
     st.divider()
 
@@ -520,6 +610,52 @@ with tab_decision:
                    "Blocage : ETF RSI > 70 · Crypto RSI > 75 (part réallouée vers le RSI le plus bas). "
                    "Boost : ETF RSI < 40 · Crypto RSI < 35 (achat surpondéré +50 %). "
                    "Quantités en titres (PEA) / jetons (crypto).")
+
+with tab_bilan:
+    st.subheader("🧾 Bilan & Fiscalité")
+
+    # --- Suivi du plafond PEA ---
+    st.markdown("### 📊 Plafond PEA")
+    pea_value = sum(position_value(l) for l in PEA_LINES)
+    versements = st.number_input(
+        "Versements cumulés sur le PEA (€)", min_value=0.0, max_value=1_000_000.0,
+        value=float(round(pea_value)), step=500.0,
+        help="Le plafond de 150 000 € porte sur les versements, pas sur la valeur du portefeuille.")
+    PLAFOND_PEA = 150_000.0
+    reste = max(PLAFOND_PEA - versements, 0.0)
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Versements", f"{versements:,.0f} €")
+    b2.metric("Plafond", f"{PLAFOND_PEA:,.0f} €")
+    b3.metric("Disponible", f"{reste:,.0f} €")
+    st.progress(min(versements / PLAFOND_PEA, 1.0))
+    if versements >= PLAFOND_PEA:
+        st.warning("Plafond de versements PEA atteint (150 000 €).")
+
+    st.divider()
+
+    # --- Rappels fiscaux ---
+    st.markdown("### 📜 Rappels fiscaux")
+    st.info("**PEA** — Exonération d'impôt sur le revenu sur les gains après **5 ans** de détention "
+            "(à compter du 1er versement). Les **prélèvements sociaux de 17,2 %** restent dus. "
+            "Un retrait avant 5 ans entraîne en principe la clôture du plan.")
+    st.info("**Crypto** — **Flat tax de 30 %** (12,8 % IR + 17,2 % PS) uniquement en cas de "
+            "**conversion vers l'euro / monnaie fiat** (les échanges crypto↔crypto ne sont pas "
+            "imposés). **Exonération** si le total des cessions imposables est **< 305 € / an**.")
+    st.caption("⚠️ Rappels indicatifs et simplifiés — ne constituent pas un conseil fiscal.")
+
+    st.divider()
+
+    # --- Alertes RSI (Telegram) ---
+    st.markdown("### 📩 Alertes RSI")
+    alerts = rsi_alerts(deci)
+    if not alerts:
+        st.success("Aucun actif en opportunité (RSI < 35) ni en surachat (RSI > 75) actuellement.")
+    else:
+        for a in alerts:
+            st.write("- " + a)
+        if st.button("📩 Envoyer ces alertes par Telegram", use_container_width=True):
+            ok, detail = send_telegram_alert("📊 Alertes RSI :\n" + "\n".join(alerts))
+            (st.success if ok else st.error)(detail)
 
 with st.spinner("Scan des marchés en cours…"):
     scan, histories = run_scan()

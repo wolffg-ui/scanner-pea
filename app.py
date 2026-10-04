@@ -117,18 +117,26 @@ def eur_usd_rate() -> float:
     return rate if rate > 0 else 1.0
 
 
-def position_value(line: str) -> float:
-    """Valeur actuelle d'une ligne (€) = quantité × dernier prix.
+def unit_price_eur(line: str) -> float:
+    """Dernier prix unitaire d'une ligne en EUR.
 
     Les cryptos sont cotées en USD (tickers *-USD) : on convertit en EUR via EURUSD=X.
     """
     pos = POSITIONS.get(line)
     if not pos:
         return 0.0
-    value = pos["qty"] * latest_price(pos["ticker"])
+    price = latest_price(pos["ticker"])
     if line in CRYPTO_LINES:  # prix en USD -> conversion en EUR
-        value /= eur_usd_rate()
-    return value
+        price /= eur_usd_rate()
+    return price
+
+
+def position_value(line: str) -> float:
+    """Valeur actuelle d'une ligne (€) = quantité détenue × dernier prix unitaire."""
+    pos = POSITIONS.get(line)
+    if not pos:
+        return 0.0
+    return pos["qty"] * unit_price_eur(line)
 
 
 # ----------------------------------------------------------------------------
@@ -176,6 +184,59 @@ def run_scan() -> tuple[pd.DataFrame, dict]:
         histories[symbol] = df
         rows.append({"Actif": symbol, "Univers": group, "Type": kind, **res})
     return pd.DataFrame(rows), histories
+
+
+# ----------------------------------------------------------------------------
+# Aide à la décision (RSI 14j · Moyennes mobiles MM50 / MM200)
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_close(ticker: str, period: str = "2y") -> pd.Series:
+    """Historique de clôtures assez long pour calculer la MM200."""
+    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+    close = df["Close"].dropna()
+    close.index = close.index.tz_localize(None)
+    return close
+
+
+def rsi_advice(value: float) -> str:
+    if value < 30:
+        return "🟢 Opportunité (Survente)"
+    if value > 70:
+        return "🔴 Attention (Surachat)"
+    return "⚪ Neutre"
+
+
+def trend_signal(price: float, mm200: float) -> str:
+    if mm200 != mm200:  # NaN : pas assez d'historique pour la MM200
+        return "—"
+    return "🟢 Tendance Haussière" if price > mm200 else "🔴 Tendance Baissière"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def decision_table() -> pd.DataFrame:
+    """RSI(14) + MM50/MM200 pour chaque ligne détenue (PEA & Crypto)."""
+    rows = []
+    for line, pos in POSITIONS.items():
+        try:
+            close = fetch_close(pos["ticker"])
+            price = float(close.iloc[-1])
+            rsi_now = float(rsi(close).iloc[-1])
+            mm50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float("nan")
+            mm200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
+        except Exception:
+            continue
+        rows.append({
+            "Univers": "Crypto" if line in CRYPTO_LINES else "PEA",
+            "Ligne": line,
+            "Ticker": pos["ticker"],
+            "Prix": price,
+            "RSI(14)": rsi_now,
+            "Conseil RSI": rsi_advice(rsi_now),
+            "MM50": mm50,
+            "MM200": mm200,
+            "Tendance": trend_signal(price, mm200),
+        })
+    return pd.DataFrame(rows)
 
 
 # ----------------------------------------------------------------------------
@@ -248,7 +309,8 @@ c1.metric("Budget du mois", f"{budget:,.0f} €")
 c2.metric("Enveloppe Cœur PEA", f"{core_env:,.0f} €", f"{core_pct}%")
 c3.metric("Enveloppe Opportunités", f"{opp_env:,.0f} €", f"{100 - core_pct}%")
 
-tab_core, tab_scan, tab_opp = st.tabs(["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités"])
+tab_core, tab_scan, tab_opp, tab_decision = st.tabs(
+    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision"])
 
 with tab_core:
     if sum(targets.values()) == 0:
@@ -270,6 +332,62 @@ with tab_core:
         )
         if sum(crypto_values.values()):
             st.caption("Crypto détenue : " + " · ".join(f"{k} {v:,.0f} €" for k, v in crypto_values.items()))
+
+with tab_decision:
+    # --- Modules 1 & 2 : RSI(14) + Moyennes mobiles MM50/MM200 ---
+    st.subheader("📊 Signaux techniques — RSI 14j & Tendance MM50/MM200")
+    with st.spinner("Calcul des indicateurs…"):
+        deci = decision_table()
+    if deci.empty:
+        st.error("Aucune donnée récupérée pour les lignes détenues (réseau / yfinance).")
+    else:
+        st.dataframe(
+            deci[["Univers", "Ligne", "Ticker", "Prix", "RSI(14)", "Conseil RSI",
+                  "MM50", "MM200", "Tendance"]].style.format({
+                "Prix": "{:,.2f}", "RSI(14)": "{:.1f}", "MM50": "{:,.2f}", "MM200": "{:,.2f}"}),
+            hide_index=True, use_container_width=True,
+        )
+        st.caption("RSI < 30 : survente (opportunité) · > 70 : surachat (attention) · "
+                   "Tendance selon la position du prix vs MM200. "
+                   "Prix/MM des cryptos exprimés en USD (signaux inchangés).")
+
+    st.divider()
+
+    # --- Module 3 : Rebalancement DCA ---
+    st.subheader("💸 Rebalancement DCA")
+    lines = list(POSITIONS.keys())
+    dca_amount = st.number_input("Montant d'investissement mensuel (€)", min_value=0.0,
+                                 value=200.0, step=50.0, key="dca_amount")
+    st.markdown("**Allocation cible (%)** — modifiable par ligne")
+    default_pct = round(100 / len(lines), 1)
+    dca_targets, cols = {}, st.columns(len(lines))
+    for col, line in zip(cols, lines):
+        dca_targets[line] = col.number_input(line, min_value=0.0, value=float(default_pct),
+                                              step=1.0, key=f"dca_target_{line}")
+
+    if sum(dca_targets.values()) == 0:
+        st.error("Les allocations cibles sont toutes à 0.")
+    elif dca_amount <= 0:
+        st.info("Saisis un montant mensuel pour obtenir les quantités à acheter.")
+    else:
+        if round(sum(dca_targets.values()), 1) != 100:
+            st.warning(f"Les cibles totalisent {sum(dca_targets.values()):.0f}% : "
+                       "elles sont normalisées à 100%.")
+        current = {line: position_value(line) for line in lines}
+        dca = allocate_core(dca_amount, current, dca_targets)
+        dca["Prix unitaire (€)"] = dca["Ligne"].map(unit_price_eur)
+        dca["Qté à acheter"] = (dca["À investir (€)"]
+                                / dca["Prix unitaire (€)"].replace(0, np.nan)).fillna(0)
+        st.dataframe(
+            dca[["Ligne", "Valeur actuelle (€)", "Poids actuel", "Poids cible",
+                 "À investir (€)", "Prix unitaire (€)", "Qté à acheter"]].style.format({
+                "Valeur actuelle (€)": "{:,.0f}", "Poids actuel": "{:.1%}", "Poids cible": "{:.1%}",
+                "À investir (€)": "{:,.2f}", "Prix unitaire (€)": "{:,.2f}", "Qté à acheter": "{:,.4f}",
+            }).background_gradient(subset=["Qté à acheter"], cmap="Greens"),
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(f"Répartition de **{dca_amount:,.0f} €** ce mois-ci pour converger vers l'allocation cible "
+                   "(quantités en titres pour le PEA, en jetons pour la crypto).")
 
 with st.spinner("Scan des marchés en cours…"):
     scan, histories = run_scan()

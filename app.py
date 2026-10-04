@@ -54,8 +54,8 @@ DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets":
 # la valeur actuelle de chaque ligne (quantité × dernier prix).
 POSITIONS = {
     # PEA (quantités en parts, prix en €)
-    "MSCI Europe": {"ticker": "MEUD.PA", "qty": 15, "target_eur": 584.55},
-    "Nasdaq 100": {"ticker": "PUUST.PA", "qty": 6, "target_eur": 654.72},
+    "MSCI Europe": {"ticker": "PCEU.PA", "qty": 15, "target_eur": 584.55},
+    "Nasdaq 100": {"ticker": "PUST.PA", "qty": 6, "target_eur": 654.72},
     "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
     "Veolia": {"ticker": "VIE.PA", "qty": 3, "target_eur": 91.83},
     # Crypto (quantités en unités, prix en USD)
@@ -73,8 +73,8 @@ COINGECKO_IDS = {
 
 # Allocation cible recommandée par défaut du module Smart DCA (en %), par ligne.
 DCA_DEFAULT_TARGETS = {
-    "MSCI Europe": 35,            # MEUD.PA
-    "Nasdaq 100": 25,            # PUUST.PA
+    "MSCI Europe": 35,            # PCEU.PA
+    "Nasdaq 100": 25,            # PUST.PA
     "MSCI Emerging Markets": 15,  # PAEEM.PA
     "Veolia": 5,                 # VIE.PA
     "ETH": 15,                   # ETH-USD
@@ -551,7 +551,7 @@ with tab_decision:
                 st.warning(
                     f"**{r['Ligne']}** — PV latente {r['PV latente']:+.0%}, RSI {r['RSI(14)']:.0f}\n\n"
                     "💡 Prise de profit recommandée : Envisager de sécuriser 10% à 20% de cette "
-                    "position pour réinvestir vers le Cœur PEA (MEUD.PA / PAEEM.PA).")
+                    "position pour réinvestir vers le Cœur PEA (PCEU.PA / PAEEM.PA).")
             st.dataframe(
                 secure[["Univers", "Ligne", "Ticker", "Prix", "PV latente", "RSI(14)"]].style.format(
                     {"Prix": "{:,.2f}", "PV latente": "{:+.1%}", "RSI(14)": "{:.1f}"}),

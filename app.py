@@ -1,13 +1,14 @@
 """Scanner d'opportunités & assistant d'allocation (PEA + CTO/Crypto).
 
 Lancer : streamlit run app.py
-Dépendances : pip install streamlit yfinance pandas numpy plotly
+Dépendances : pip install streamlit yfinance pandas numpy plotly requests
 """
 import hmac
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -31,26 +32,36 @@ if not st.session_state.get("authenticated"):
 # ----------------------------------------------------------------------------
 # Univers
 # ----------------------------------------------------------------------------
-TICKERS = {
-    # PEA
-    "CW8.PA": {"name": "Amundi MSCI World", "universe": "PEA"},
-    "PAEEM.PA": {"name": "Amundi MSCI Emerging", "universe": "PEA"},
-    "LYXW.PA": {"name": "Amundi MSCI Water", "universe": "PEA"},
-    # CTO
-    "REMX": {"name": "VanEck Rare Earth/Terres Rares", "universe": "CTO"},
-    "GDX": {"name": "VanEck Gold Miners", "universe": "CTO"},
-    "GLD": {"name": "SPDR Gold Shares", "universe": "CTO"},
-    "O": {"name": "Realty Income", "universe": "CTO"},
-    "PEP": {"name": "PepsiCo", "universe": "CTO"},
-    "JNJ": {"name": "Johnson & Johnson", "universe": "CTO"},
-    # Crypto
-    "BTC-USD": {"name": "Bitcoin", "universe": "Crypto"},
-    "ETH-USD": {"name": "Ethereum", "universe": "Crypto"},
-    "SOL-USD": {"name": "Solana", "universe": "Crypto"},
+WATCHLIST_STOCKS = {
+    "Tech": ["NVDA", "MSFT", "AAPL"],
+    "Value/Dividendes": ["JNJ", "KO", "PG", "O", "PEP"],
 }
-PEA_LINES = [t["name"] for t in TICKERS.values() if t["universe"] == "PEA"]
-CRYPTO_LINES = [t["name"] for t in TICKERS.values() if t["universe"] == "Crypto"]
-DEFAULT_TARGETS = dict(zip(PEA_LINES, [60, 15, 25]))
+# symbole -> (id CoinGecko, ticker yfinance de secours)
+WATCHLIST_CRYPTO = {
+    "SOL": ("solana", "SOL-USD"),
+    "AVAX": ("avalanche-2", "AVAX-USD"),
+    "LINK": ("chainlink", "LINK-USD"),
+    "ONDO": ("ondo-finance", "ONDO-USD"),
+    "FET": ("fetch-ai", "FET-USD"),
+    "ARB": ("arbitrum", "ARB-USD"),
+}
+PEA_LINES = ["MSCI Europe", "Nasdaq 100", "MSCI Emerging Markets", "Veolia"]
+CRYPTO_LINES = ["ETH", "XRP", "TRX"]
+DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets": 20, "Veolia": 20}
+
+# Positions détenues : ligne -> (ticker yfinance, quantité). Sert à pré-remplir
+# la valeur actuelle de chaque ligne (quantité × dernier prix).
+POSITIONS = {
+    # PEA (quantités en parts, prix en €)
+    "MSCI Europe": {"ticker": "MEUD.PA", "qty": 15},
+    "Nasdaq 100": {"ticker": "PUUST.PA", "qty": 6},
+    "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
+    "Veolia": {"ticker": "VIE.PA", "qty": 36},
+    # Crypto (quantités en unités, prix en USD)
+    "ETH": {"ticker": "ETH-USD", "qty": 1.00785},
+    "XRP": {"ticker": "XRP-USD", "qty": 60.740026},
+    "TRX": {"ticker": "TRX-USD", "qty": 34.790716},
+}
 
 RSI_THRESHOLD = 35
 LOOKBACK = 20
@@ -66,6 +77,46 @@ def fetch_yf(ticker: str) -> pd.DataFrame:
     df = df[["Close", "High", "Volume"]].dropna().tail(60)
     df.index = df.index.tz_localize(None)
     return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_coingecko(coin_id: str) -> pd.DataFrame:
+    r = requests.get(
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+        params={"vs_currency": "eur", "days": 60, "interval": "daily"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    prices = pd.Series({pd.to_datetime(t, unit="ms"): p for t, p in data["prices"]})
+    vols = pd.Series({pd.to_datetime(t, unit="ms"): v for t, v in data["total_volumes"]})
+    df = pd.DataFrame({"Close": prices, "Volume": vols}).dropna()
+    df["High"] = df["Close"]  # CoinGecko daily n'expose pas le plus haut intraday
+    return df.tail(60)
+
+
+def fetch_crypto(symbol: str) -> pd.DataFrame:
+    coin_id, yf_ticker = WATCHLIST_CRYPTO[symbol]
+    try:
+        return fetch_coingecko(coin_id)
+    except Exception:
+        return fetch_yf(yf_ticker)  # repli si CoinGecko est limité / indisponible
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def latest_price(ticker: str) -> float:
+    try:
+        return float(fetch_yf(ticker)["Close"].iloc[-1])
+    except Exception:
+        return 0.0  # repli si le ticker est indisponible
+
+
+def position_value(line: str) -> float:
+    """Valeur actuelle d'une ligne = quantité détenue × dernier prix."""
+    pos = POSITIONS.get(line)
+    if not pos:
+        return 0.0
+    return pos["qty"] * latest_price(pos["ticker"])
 
 
 # ----------------------------------------------------------------------------
@@ -100,16 +151,18 @@ def analyse(df: pd.DataFrame) -> dict | None:
 @st.cache_data(ttl=1800, show_spinner=False)
 def run_scan() -> tuple[pd.DataFrame, dict]:
     rows, histories = [], {}
-    for symbol, meta in TICKERS.items():
+    jobs = [(t, grp, "Action", fetch_yf) for grp, ts in WATCHLIST_STOCKS.items() for t in ts]
+    jobs += [(s, "Crypto", "Crypto", fetch_crypto) for s in WATCHLIST_CRYPTO]
+    for symbol, group, kind, fetcher in jobs:
         try:
-            df = fetch_yf(symbol)
+            df = fetcher(symbol)
             res = analyse(df)
         except Exception:
             res = None
         if res is None:
             continue
         histories[symbol] = df
-        rows.append({"Actif": symbol, "Nom": meta["name"], "Univers": meta["universe"], **res})
+        rows.append({"Actif": symbol, "Univers": group, "Type": kind, **res})
     return pd.DataFrame(rows), histories
 
 
@@ -164,9 +217,9 @@ with st.sidebar:
     with st.form("holdings"):
         st.subheader("Valeur actuelle des lignes")
         st.markdown("**PEA**")
-        pea_values = {n: st.number_input(f"{n} (€)", min_value=0.0, value=0.0, step=50.0) for n in PEA_LINES}
+        pea_values = {n: st.number_input(f"{n} (€)", min_value=0.0, value=position_value(n), step=50.0) for n in PEA_LINES}
         st.markdown("**Crypto**")
-        crypto_values = {n: st.number_input(f"{n} (€)", min_value=0.0, value=0.0, step=50.0) for n in CRYPTO_LINES}
+        crypto_values = {n: st.number_input(f"{n} (€)", min_value=0.0, value=position_value(n), step=50.0) for n in CRYPTO_LINES}
         st.markdown("**Allocation cible PEA (%)**")
         targets = {n: st.number_input(f"Cible {n}", 0, 100, DEFAULT_TARGETS[n], step=5) for n in PEA_LINES}
         st.form_submit_button("Mettre à jour", use_container_width=True)
@@ -211,18 +264,17 @@ with st.spinner("Scan des marchés en cours…"):
 
 if scan.empty:
     for tab in (tab_scan, tab_opp):
-        tab.error("Aucune donnée récupérée (réseau, yfinance indisponible).")
+        tab.error("Aucune donnée récupérée (réseau, yfinance ou CoinGecko indisponible).")
     st.stop()
 
 signals = scan[scan["dip"] | scan["breakout"]]
-opp_signals = signals[signals["Univers"] != "PEA"]  # l'enveloppe Opportunités va sur CTO / Crypto
 
 with tab_scan:
     st.caption(f"Dip : RSI(14) < {RSI_THRESHOLD} · Breakout : prix > plus haut {LOOKBACK}j "
                f"et volume > {VOLUME_MULT:.0f}× la moyenne {LOOKBACK}j · fenêtre 60 jours")
     view = scan.assign(Signal=np.select([scan.dip, scan.breakout], ["🟢 Dip", "🔵 Breakout"], "—"))
     st.dataframe(
-        view[["Univers", "Actif", "Nom", "price", "rsi", "high20", "vol_ratio", "perf_60d", "Signal"]].rename(columns={
+        view[["Actif", "Univers", "price", "rsi", "high20", "vol_ratio", "perf_60d", "Signal"]].rename(columns={
             "price": "Prix", "rsi": "RSI(14)", "high20": f"Plus haut {LOOKBACK}j",
             "vol_ratio": "Volume / moy.", "perf_60d": "Perf 60j"}).style.format({
             "Prix": "{:,.2f}", "RSI(14)": "{:.1f}", f"Plus haut {LOOKBACK}j": "{:,.2f}",
@@ -231,35 +283,24 @@ with tab_scan:
     )
 
 with tab_opp:
-    pea_signals = signals[signals["Univers"] == "PEA"]
-    if not pea_signals.empty:
-        st.info("Signaux sur ETF PEA (à passer via le Cœur PEA) : "
-                + ", ".join(f"{r['Nom']} ({'Dip' if r['dip'] else 'Breakout'})" for _, r in pea_signals.iterrows()))
-    if opp_signals.empty:
-        st.info("Aucun signal CTO/Crypto aujourd'hui : l'enveloppe Opportunités peut être mise de côté.")
+    if signals.empty:
+        st.info("Aucun signal Dip ou Breakout aujourd'hui : l'enveloppe Opportunités peut être mise de côté.")
     else:
-        alloc = allocate_opportunities(opp_env, opp_signals)
+        alloc = allocate_opportunities(opp_env, signals)
         st.subheader(f"Allocation de {opp_env:,.0f} € sur {len(alloc)} signal(aux)")
         cols = st.columns(len(alloc))
         for col, (_, r) in zip(cols, alloc.iterrows()):
-            col.metric(f"{r['Signal']} · {r['Actif']} ({r['Univers']})", f"{r['Montant (€)']:,.0f} €",
+            col.metric(f"{r['Signal']} · {r['Actif']}", f"{r['Montant (€)']:,.0f} €",
                        f"RSI {r['rsi']:.0f} · {r['perf_60d']:+.1%} /60j",
                        delta_color="normal" if r["dip"] else "off")
-        st.dataframe(
-            alloc[["Univers", "Actif", "Nom", "Signal", "price", "rsi", "Montant (€)"]].rename(
-                columns={"price": "Prix", "rsi": "RSI(14)"}).style.format(
-                {"Prix": "{:,.2f}", "RSI(14)": "{:.1f}", "Montant (€)": "{:,.0f}"}),
-            hide_index=True, use_container_width=True,
-        )
 
-    if not signals.empty:
         st.subheader("Actifs en alerte")
         for _, r in signals.iterrows():
             df = histories[r["Actif"]]
             fig = go.Figure(go.Scatter(x=df.index, y=df["Close"], mode="lines", name=r["Actif"],
                                        line=dict(color="#16a34a" if r["dip"] else "#2563eb")))
             fig.add_hline(y=r["high20"], line_dash="dot", annotation_text=f"Plus haut {LOOKBACK}j")
-            fig.update_layout(title=f"[{r['Univers']}] {r['Nom']} — {'Dip' if r['dip'] else 'Breakout'} "
+            fig.update_layout(title=f"{r['Actif']} — {'Dip' if r['dip'] else 'Breakout'} "
                                     f"(RSI {r['rsi']:.0f}, vol {r['vol_ratio']:.1f}×)",
                               height=300, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig, use_container_width=True)

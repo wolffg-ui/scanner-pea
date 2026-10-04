@@ -4,7 +4,8 @@ Lancer : streamlit run app.py
 Dépendances : pip install streamlit yfinance pandas numpy plotly requests
 """
 import hmac
-import os
+import smtplib
+from email.mime.text import MIMEText
 
 import numpy as np
 import pandas as pd
@@ -288,37 +289,33 @@ def decision_table() -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# Alertes Telegram
+# Alertes e-mail (SMTP Gmail)
 # ----------------------------------------------------------------------------
-def _telegram_config() -> tuple[str | None, str | None]:
-    """Jeton et chat_id Telegram, lus depuis st.secrets puis les variables d'environnement."""
-    token = chat_id = None
+def send_email_alert(subject: str, body: str) -> tuple[bool, str]:
+    """Envoie un e-mail d'alerte via SMTP Gmail (TLS, port 587). Retourne (succès, détail).
+
+    Config via st.secrets : EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER.
+    Pour Gmail, utiliser un « mot de passe d'application » (2FA activée).
+    """
     try:
-        token = st.secrets.get("TELEGRAM_TOKEN")
-        chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
+        sender = st.secrets["EMAIL_SENDER"]
+        password = st.secrets["EMAIL_PASSWORD"]
+        receiver = st.secrets["EMAIL_RECEIVER"]
     except Exception:
-        pass
-    token = token or os.environ.get("TELEGRAM_TOKEN")
-    chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
-    return token, chat_id
-
-
-def send_telegram_alert(message: str) -> tuple[bool, str]:
-    """Envoie `message` via l'API Bot Telegram. Retourne (succès, détail)."""
-    token, chat_id = _telegram_config()
-    if not token or not chat_id:
-        return False, ("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID non configurés "
-                       "(st.secrets ou variables d'environnement).")
+        return False, ("EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVER non configurés "
+                       "dans st.secrets (.streamlit/secrets.toml).")
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return True, "Alerte Telegram envoyée ✅"
+        msg = MIMEText(body, _charset="utf-8")
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = receiver
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, [receiver], msg.as_string())
+        return True, "E-mail d'alerte envoyé ✅"
     except Exception as e:
-        return False, f"Échec de l'envoi Telegram : {e}"
+        return False, f"Échec de l'envoi de l'e-mail : {e}"
 
 
 def rsi_alerts(deci: pd.DataFrame) -> list:
@@ -473,9 +470,11 @@ with st.sidebar:
         st.form_submit_button("Mettre à jour", use_container_width=True)
 
     st.divider()
-    st.subheader("📩 Alertes Telegram")
-    if st.button("📩 Tester l'envoi d'une alerte Telegram", use_container_width=True):
-        ok, detail = send_telegram_alert("✅ Test d'alerte — Scanner d'opportunités & allocation.")
+    st.subheader("📩 Alertes e-mail")
+    if st.button("📩 Tester l'envoi d'un e-mail d'alerte", use_container_width=True):
+        ok, detail = send_email_alert(
+            "Test d'alerte — Scanner d'opportunités",
+            "✅ Ceci est un e-mail de test du Scanner d'opportunités & allocation.")
         (st.success if ok else st.error)(detail)
 
 core_env = budget * core_pct / 100
@@ -645,7 +644,7 @@ with tab_bilan:
 
     st.divider()
 
-    # --- Alertes RSI (Telegram) ---
+    # --- Alertes RSI (e-mail) ---
     st.markdown("### 📩 Alertes RSI")
     alerts = rsi_alerts(deci)
     if not alerts:
@@ -653,8 +652,9 @@ with tab_bilan:
     else:
         for a in alerts:
             st.write("- " + a)
-        if st.button("📩 Envoyer ces alertes par Telegram", use_container_width=True):
-            ok, detail = send_telegram_alert("📊 Alertes RSI :\n" + "\n".join(alerts))
+        if st.button("📩 Envoyer ces alertes par e-mail", use_container_width=True):
+            ok, detail = send_email_alert("Alertes RSI — Scanner d'opportunités",
+                                          "📊 Alertes RSI :\n" + "\n".join(alerts))
             (st.success if ok else st.error)(detail)
 
 with st.spinner("Scan des marchés en cours…"):

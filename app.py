@@ -63,6 +63,13 @@ POSITIONS = {
     "TRX": {"ticker": "TRX-USD", "qty": 34.790716},
 }
 
+# Ticker yfinance -> id CoinGecko (pour les cours crypto en direct en EUR)
+COINGECKO_IDS = {
+    "ETH-USD": "ethereum",
+    "XRP-USD": "ripple",
+    "TRX-USD": "tron",
+}
+
 RSI_THRESHOLD = 35
 LOOKBACK = 20
 VOLUME_MULT = 2.0
@@ -71,7 +78,7 @@ VOLUME_MULT = 2.0
 # ----------------------------------------------------------------------------
 # Données
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)  # cours PEA/ETF mis en cache 10 min
 def fetch_yf(ticker: str) -> pd.DataFrame:
     df = yf.Ticker(ticker).history(period="4mo", interval="1d", auto_adjust=True)
     df = df[["Close", "High", "Volume"]].dropna().tail(60)
@@ -103,7 +110,7 @@ def fetch_crypto(symbol: str) -> pd.DataFrame:
         return fetch_yf(yf_ticker)  # repli si CoinGecko est limité / indisponible
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)  # cache 10 min
 def latest_price(ticker: str) -> float:
     try:
         return float(fetch_yf(ticker)["Close"].iloc[-1])
@@ -117,18 +124,41 @@ def eur_usd_rate() -> float:
     return rate if rate > 0 else 1.0
 
 
+@st.cache_data(ttl=600, show_spinner=False)  # cours crypto mis en cache 10 min
+def fetch_crypto_prices_eur() -> dict:
+    """Cours crypto en direct, en EUR, via l'API publique CoinGecko simple/price.
+
+    Retourne {ticker_yf: prix_eur}. Repli sur {} si l'API est indisponible.
+    """
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ",".join(COINGECKO_IDS.values()), "vs_currencies": "eur"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return {tk: float(data[cg]["eur"]) for tk, cg in COINGECKO_IDS.items() if cg in data}
+    except Exception:
+        return {}
+
+
 def unit_price_eur(line: str) -> float:
     """Dernier prix unitaire d'une ligne en EUR.
 
-    Les cryptos sont cotées en USD (tickers *-USD) : on convertit en EUR via EURUSD=X.
+    Crypto : cours direct en EUR via CoinGecko ; repli yfinance (USD) converti via EURUSD=X.
+    PEA/ETF : cours yfinance, déjà en EUR.
     """
     pos = POSITIONS.get(line)
     if not pos:
         return 0.0
-    price = latest_price(pos["ticker"])
-    if line in CRYPTO_LINES:  # prix en USD -> conversion en EUR
-        price /= eur_usd_rate()
-    return price
+    ticker = pos["ticker"]
+    if line in CRYPTO_LINES:
+        eur_prices = fetch_crypto_prices_eur()
+        if ticker in eur_prices:
+            return eur_prices[ticker]
+        return latest_price(ticker) / eur_usd_rate()  # repli si CoinGecko indisponible
+    return latest_price(ticker)
 
 
 def position_value(line: str) -> float:

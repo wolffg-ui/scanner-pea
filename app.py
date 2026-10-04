@@ -53,10 +53,10 @@ DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets":
 # la valeur actuelle de chaque ligne (quantité × dernier prix).
 POSITIONS = {
     # PEA (quantités en parts, prix en €)
-    "MSCI Europe": {"ticker": "MEUD.PA", "qty": 15},
-    "Nasdaq 100": {"ticker": "PUUST.PA", "qty": 6},
+    "MSCI Europe": {"ticker": "MEUD.PA", "qty": 15, "target_eur": 584.55},
+    "Nasdaq 100": {"ticker": "PUUST.PA", "qty": 6, "target_eur": 654.72},
     "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
-    "Veolia": {"ticker": "VIE.PA", "qty": 36},
+    "Veolia": {"ticker": "VIE.PA", "qty": 36, "target_eur": 91.83},
     # Crypto (quantités en unités, prix en USD)
     "ETH": {"ticker": "ETH-USD", "qty": 1.00785},
     "XRP": {"ticker": "XRP-USD", "qty": 60.740026},

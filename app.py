@@ -70,6 +70,17 @@ COINGECKO_IDS = {
     "TRX-USD": "tron",
 }
 
+# Allocation cible recommandée par défaut du module Smart DCA (en %), par ligne.
+DCA_DEFAULT_TARGETS = {
+    "MSCI Europe": 35,            # MEUD.PA
+    "Nasdaq 100": 25,            # PUUST.PA
+    "MSCI Emerging Markets": 15,  # PAEEM.PA
+    "Veolia": 5,                 # VIE.PA
+    "ETH": 15,                   # ETH-USD
+    "XRP": 2.5,                  # XRP-USD / TRX-USD : 5 % répartis
+    "TRX": 2.5,
+}
+
 RSI_THRESHOLD = 35
 LOOKBACK = 20
 VOLUME_MULT = 2.0
@@ -307,6 +318,57 @@ def allocate_opportunities(envelope: float, signals: pd.DataFrame, max_n: int = 
     return s
 
 
+DCA_WARNING = "⚠️ Ligne en surachat / Tendance défavorable. Réallocation temporaire conseillée."
+
+
+def smart_dca_allocate(envelope: float, current: dict, targets: dict, info: dict) -> pd.DataFrame:
+    """Smart DCA : comble les déficits de rebalancement en dirigeant le budget EN PRIORITÉ
+    vers les lignes favorables (RSI < 50 ou tendance neutre/haussière) et en écartant
+    temporairement les lignes en surachat (RSI > 70) ou en tendance baissière.
+
+    info : {ligne: {"rsi": float, "trend": str}} issu de decision_table().
+    """
+    tw = pd.Series(targets, dtype=float)
+    tw = tw / tw.sum()
+    cur = pd.Series(current, dtype=float)[tw.index]
+    total_after = cur.sum() + envelope
+    deficit = (tw * total_after - cur).clip(lower=0)
+
+    rsi = pd.Series({l: info.get(l, {}).get("rsi", float("nan")) for l in tw.index})
+    trend = pd.Series({l: info.get(l, {}).get("trend", "—") for l in tw.index})
+    avoid = (rsi > 70) | (trend == "🔴 Tendance Baissière")  # surachat / tendance défavorable
+
+    eligible = ~avoid
+    if not eligible.any():  # toutes les lignes sont défavorables : rebalancement standard
+        eligible = pd.Series(True, index=tw.index)
+
+    # Budget d'abord sur les déficits des lignes éligibles, puis reliquat selon les
+    # poids cibles (restreints aux lignes éligibles).
+    elig_def = deficit.where(eligible, 0.0)
+    if elig_def.sum() >= envelope > 0:
+        buy = elig_def / elig_def.sum() * envelope
+    else:
+        buy = elig_def.copy()
+        reste = envelope - elig_def.sum()
+        w = tw.where(eligible, 0.0)
+        if w.sum() > 0 and reste > 0:
+            buy = buy + w / w.sum() * reste
+
+    after = cur + buy
+    warn = avoid & (deficit > 0)  # aurait dû être acheté mais écarté
+    return pd.DataFrame({
+        "Ligne": tw.index,
+        "Valeur actuelle (€)": cur.values,
+        "Poids actuel": (cur / cur.sum()).fillna(0).values if cur.sum() else 0.0,
+        "Poids cible": tw.values,
+        "RSI(14)": rsi.values,
+        "Tendance": trend.values,
+        "À investir (€)": buy.values,
+        "Poids après": (after / total_after).values,
+        "Avertissement": np.where(warn.values, DCA_WARNING, ""),
+    })
+
+
 # ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
@@ -383,16 +445,16 @@ with tab_decision:
 
     st.divider()
 
-    # --- Module 3 : Rebalancement DCA ---
-    st.subheader("💸 Rebalancement DCA")
+    # --- Module 3 : Smart DCA (rebalancement + conseils conditionnels) ---
+    st.subheader("💸 Smart DCA — rebalancement & conseils conditionnels")
     lines = list(POSITIONS.keys())
     dca_amount = st.number_input("Montant d'investissement mensuel (€)", min_value=0.0,
                                  value=200.0, step=50.0, key="dca_amount")
     st.markdown("**Allocation cible (%)** — modifiable par ligne")
-    default_pct = round(100 / len(lines), 1)
     dca_targets, cols = {}, st.columns(len(lines))
     for col, line in zip(cols, lines):
-        dca_targets[line] = col.number_input(line, min_value=0.0, value=float(default_pct),
+        default_pct = float(DCA_DEFAULT_TARGETS.get(line, round(100 / len(lines), 1)))
+        dca_targets[line] = col.number_input(line, min_value=0.0, value=default_pct,
                                               step=1.0, key=f"dca_target_{line}")
 
     if sum(dca_targets.values()) == 0:
@@ -404,20 +466,29 @@ with tab_decision:
             st.warning(f"Les cibles totalisent {sum(dca_targets.values()):.0f}% : "
                        "elles sont normalisées à 100%.")
         current = {line: position_value(line) for line in lines}
-        dca = allocate_core(dca_amount, current, dca_targets)
+        info = ({r["Ligne"]: {"rsi": r["RSI(14)"], "trend": r["Tendance"]}
+                 for _, r in deci.iterrows()} if not deci.empty else {})
+        dca = smart_dca_allocate(dca_amount, current, dca_targets, info)
         dca["Prix unitaire (€)"] = dca["Ligne"].map(unit_price_eur)
         dca["Qté à acheter"] = (dca["À investir (€)"]
                                 / dca["Prix unitaire (€)"].replace(0, np.nan)).fillna(0)
         st.dataframe(
-            dca[["Ligne", "Valeur actuelle (€)", "Poids actuel", "Poids cible",
-                 "À investir (€)", "Prix unitaire (€)", "Qté à acheter"]].style.format({
+            dca[["Ligne", "Valeur actuelle (€)", "Poids actuel", "Poids cible", "RSI(14)",
+                 "Tendance", "À investir (€)", "Prix unitaire (€)", "Qté à acheter",
+                 "Avertissement"]].style.format({
                 "Valeur actuelle (€)": "{:,.0f}", "Poids actuel": "{:.1%}", "Poids cible": "{:.1%}",
-                "À investir (€)": "{:,.2f}", "Prix unitaire (€)": "{:,.2f}", "Qté à acheter": "{:,.4f}",
+                "RSI(14)": "{:.1f}", "À investir (€)": "{:,.2f}", "Prix unitaire (€)": "{:,.2f}",
+                "Qté à acheter": "{:,.4f}",
             }).background_gradient(subset=["Qté à acheter"], cmap="Greens"),
             hide_index=True, use_container_width=True,
         )
-        st.caption(f"Répartition de **{dca_amount:,.0f} €** ce mois-ci pour converger vers l'allocation cible "
-                   "(quantités en titres pour le PEA, en jetons pour la crypto).")
+        for _, r in dca.iterrows():
+            if r["Avertissement"]:
+                st.warning(f"**{r['Ligne']}** — {r['Avertissement']}")
+        st.caption(f"Répartition de **{dca_amount:,.0f} €** ce mois-ci : budget dirigé en priorité vers les "
+                   "lignes favorables (RSI < 50 ou tendance neutre/haussière) ; les lignes en surachat "
+                   "(RSI > 70) ou baissières sont temporairement écartées. "
+                   "Quantités en titres (PEA) / jetons (crypto).")
 
 with st.spinner("Scan des marchés en cours…"):
     scan, histories = run_scan()

@@ -318,54 +318,82 @@ def allocate_opportunities(envelope: float, signals: pd.DataFrame, max_n: int = 
     return s
 
 
-DCA_WARNING = "⚠️ Ligne en surachat / Tendance défavorable. Réallocation temporaire conseillée."
+# Messages du Smart DCA selon la classe d'actif et le régime RSI.
+DCA_MESSAGES = {
+    ("ETF", "block"): "🔴 Surachat ETF (RSI > 70) — Achat temporairement bloqué",
+    ("Crypto", "block"): "🔴 Surchauffe Crypto (RSI > 75) — Achat temporairement bloqué",
+    ("ETF", "boost"): "🟢 Opportunité ETF (RSI < 40) — Surpondérer l'achat",
+    ("Crypto", "boost"): "🟢 Opportunité Crypto (RSI < 35) — Surpondérer l'achat",
+}
+DCA_BOOST = 0.5  # surpondération (+50 %) appliquée aux lignes « Opportunité »
 
 
 def smart_dca_allocate(envelope: float, current: dict, targets: dict, info: dict) -> pd.DataFrame:
-    """Smart DCA : comble les déficits de rebalancement en dirigeant le budget EN PRIORITÉ
-    vers les lignes favorables (RSI < 50 ou tendance neutre/haussière) et en écartant
-    temporairement les lignes en surachat (RSI > 70) ou en tendance baissière.
+    """Smart DCA avec filtres RSI ajustés par classe d'actifs.
 
+    - Blocage : ETF RSI > 70, Crypto RSI > 75 -> achat suspendu, sa part est réallouée
+      vers la/les ligne(s) au RSI le plus bas (les plus décotées).
+    - Boost   : ETF RSI < 40, Crypto RSI < 35 -> achat surpondéré (+50 %).
+    Base = rebalancement standard (déficits vs allocation cible) via allocate_core.
     info : {ligne: {"rsi": float, "trend": str}} issu de decision_table().
     """
-    tw = pd.Series(targets, dtype=float)
-    tw = tw / tw.sum()
-    cur = pd.Series(current, dtype=float)[tw.index]
+    base = allocate_core(envelope, current, targets)
+    idx = list(base["Ligne"])
+    buy = pd.Series(base["À investir (€)"].to_numpy(), index=idx, dtype=float)
+
+    rsi = pd.Series({l: info.get(l, {}).get("rsi", float("nan")) for l in idx})
+    trend = pd.Series({l: info.get(l, {}).get("trend", "—") for l in idx})
+    is_crypto = pd.Series({l: l in CRYPTO_LINES for l in idx})
+
+    blocked = (~is_crypto & (rsi > 70)) | (is_crypto & (rsi > 75))
+    boosted = (~is_crypto & (rsi < 40)) | (is_crypto & (rsi < 35))
+
+    # (3) Réallocation : la part des lignes bloquées va au(x) RSI le(s) plus bas.
+    freed = float(buy.where(blocked, 0.0).sum())
+    buy[blocked] = 0.0
+    if freed > 0:
+        cand = ~blocked
+        rsi_pool = rsi.where(cand) if cand.any() else rsi
+        if rsi_pool.notna().any():
+            recip = (rsi == rsi_pool.min())
+            if cand.any():
+                recip = recip & cand
+        else:  # aucun RSI connu : on étale sur les lignes non bloquées
+            recip = cand if cand.any() else pd.Series(True, index=idx)
+        n = int(recip.sum())
+        if n > 0:
+            buy[recip] = buy[recip] + freed / n
+
+    # (2) Boost : surpondérer les lignes « Opportunité », budget prélevé au prorata
+    #     sur les lignes ni boostées ni bloquées (somme investie inchangée).
+    if boosted.any():
+        extra = float((buy.where(boosted, 0.0) * DCA_BOOST).sum())
+        donors = ~boosted & ~blocked
+        donor_amt = buy.where(donors, 0.0)
+        if extra > 0 and donor_amt.sum() >= extra:
+            buy[boosted] = buy[boosted] * (1 + DCA_BOOST)
+            buy[donors] = buy[donors] - extra * donor_amt[donors] / donor_amt.sum()
+
+    def message(line: str) -> str:
+        cls = "Crypto" if line in CRYPTO_LINES else "ETF"
+        if blocked[line]:
+            return DCA_MESSAGES[(cls, "block")]
+        if boosted[line]:
+            return DCA_MESSAGES[(cls, "boost")]
+        return ""
+
+    cur = pd.Series(base["Valeur actuelle (€)"].to_numpy(), index=idx, dtype=float)
     total_after = cur.sum() + envelope
-    deficit = (tw * total_after - cur).clip(lower=0)
-
-    rsi = pd.Series({l: info.get(l, {}).get("rsi", float("nan")) for l in tw.index})
-    trend = pd.Series({l: info.get(l, {}).get("trend", "—") for l in tw.index})
-    avoid = (rsi > 70) | (trend == "🔴 Tendance Baissière")  # surachat / tendance défavorable
-
-    eligible = ~avoid
-    if not eligible.any():  # toutes les lignes sont défavorables : rebalancement standard
-        eligible = pd.Series(True, index=tw.index)
-
-    # Budget d'abord sur les déficits des lignes éligibles, puis reliquat selon les
-    # poids cibles (restreints aux lignes éligibles).
-    elig_def = deficit.where(eligible, 0.0)
-    if elig_def.sum() >= envelope > 0:
-        buy = elig_def / elig_def.sum() * envelope
-    else:
-        buy = elig_def.copy()
-        reste = envelope - elig_def.sum()
-        w = tw.where(eligible, 0.0)
-        if w.sum() > 0 and reste > 0:
-            buy = buy + w / w.sum() * reste
-
-    after = cur + buy
-    warn = avoid & (deficit > 0)  # aurait dû être acheté mais écarté
     return pd.DataFrame({
-        "Ligne": tw.index,
-        "Valeur actuelle (€)": cur.values,
-        "Poids actuel": (cur / cur.sum()).fillna(0).values if cur.sum() else 0.0,
-        "Poids cible": tw.values,
-        "RSI(14)": rsi.values,
-        "Tendance": trend.values,
-        "À investir (€)": buy.values,
-        "Poids après": (after / total_after).values,
-        "Avertissement": np.where(warn.values, DCA_WARNING, ""),
+        "Ligne": idx,
+        "Valeur actuelle (€)": cur.to_numpy(),
+        "Poids actuel": base["Poids actuel"].to_numpy(),
+        "Poids cible": base["Poids cible"].to_numpy(),
+        "RSI(14)": rsi.to_numpy(),
+        "Tendance": trend.to_numpy(),
+        "À investir (€)": buy.to_numpy(),
+        "Poids après": ((cur + buy) / total_after).to_numpy() if total_after else 0.0,
+        "Conseil DCA": [message(l) for l in idx],
     })
 
 
@@ -475,7 +503,7 @@ with tab_decision:
         st.dataframe(
             dca[["Ligne", "Valeur actuelle (€)", "Poids actuel", "Poids cible", "RSI(14)",
                  "Tendance", "À investir (€)", "Prix unitaire (€)", "Qté à acheter",
-                 "Avertissement"]].style.format({
+                 "Conseil DCA"]].style.format({
                 "Valeur actuelle (€)": "{:,.0f}", "Poids actuel": "{:.1%}", "Poids cible": "{:.1%}",
                 "RSI(14)": "{:.1f}", "À investir (€)": "{:,.2f}", "Prix unitaire (€)": "{:,.2f}",
                 "Qté à acheter": "{:,.4f}",
@@ -483,11 +511,14 @@ with tab_decision:
             hide_index=True, use_container_width=True,
         )
         for _, r in dca.iterrows():
-            if r["Avertissement"]:
-                st.warning(f"**{r['Ligne']}** — {r['Avertissement']}")
-        st.caption(f"Répartition de **{dca_amount:,.0f} €** ce mois-ci : budget dirigé en priorité vers les "
-                   "lignes favorables (RSI < 50 ou tendance neutre/haussière) ; les lignes en surachat "
-                   "(RSI > 70) ou baissières sont temporairement écartées. "
+            msg = r["Conseil DCA"]
+            if msg.startswith("🔴"):
+                st.error(f"**{r['Ligne']}** — {msg}")
+            elif msg.startswith("🟢"):
+                st.success(f"**{r['Ligne']}** — {msg}")
+        st.caption(f"Répartition de **{dca_amount:,.0f} €** ce mois-ci. "
+                   "Blocage : ETF RSI > 70 · Crypto RSI > 75 (part réallouée vers le RSI le plus bas). "
+                   "Boost : ETF RSI < 40 · Crypto RSI < 35 (achat surpondéré +50 %). "
                    "Quantités en titres (PEA) / jetons (crypto).")
 
 with st.spinner("Scan des marchés en cours…"):

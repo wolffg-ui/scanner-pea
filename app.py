@@ -291,11 +291,41 @@ def decision_table() -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Alertes e-mail (SMTP Gmail)
 # ----------------------------------------------------------------------------
-def send_email_alert(subject: str, body: str) -> tuple[bool, str]:
-    """Envoie un e-mail d'alerte via SMTP Gmail (TLS, port 587). Retourne (succès, détail).
+# Serveur SMTP (TLS 587) déduit du domaine de l'expéditeur.
+SMTP_HOSTS = {
+    "gmail.com": "smtp.gmail.com",
+    "googlemail.com": "smtp.gmail.com",
+    "yahoo.fr": "smtp.mail.yahoo.com",
+    "yahoo.com": "smtp.mail.yahoo.com",
+    "ymail.com": "smtp.mail.yahoo.com",
+    "outlook.com": "smtp-mail.outlook.com",
+    "hotmail.com": "smtp-mail.outlook.com",
+    "live.com": "smtp-mail.outlook.com",
+}
 
-    Config via st.secrets : EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER.
-    Pour Gmail, utiliser un « mot de passe d'application » (2FA activée).
+
+def _smtp_server(sender: str) -> tuple[str, int]:
+    """(host, port) SMTP : forcés par st.secrets SMTP_HOST/SMTP_PORT, sinon déduits
+    du domaine de l'expéditeur (défaut smtp.gmail.com)."""
+    host = port = None
+    try:
+        host = st.secrets.get("SMTP_HOST")
+        port = st.secrets.get("SMTP_PORT")
+    except Exception:
+        pass
+    if not host:
+        domain = sender.rsplit("@", 1)[-1].lower() if "@" in sender else ""
+        host = SMTP_HOSTS.get(domain, "smtp.gmail.com")
+    return host, int(port) if port else 587
+
+
+def send_email_alert(subject: str, body: str) -> tuple[bool, str]:
+    """Envoie un e-mail d'alerte via SMTP (TLS, port 587). Retourne (succès, détail).
+
+    Config via st.secrets : EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER
+    (et éventuellement SMTP_HOST / SMTP_PORT). Le serveur SMTP est sinon déduit
+    du domaine de l'expéditeur (Gmail, Yahoo, Outlook…). Utiliser un
+    « mot de passe d'application » (2FA activée côté fournisseur).
     """
     try:
         sender = st.secrets["EMAIL_SENDER"]
@@ -309,7 +339,8 @@ def send_email_alert(subject: str, body: str) -> tuple[bool, str]:
         msg["Subject"] = subject
         msg["From"] = sender
         msg["To"] = receiver
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+        host, port = _smtp_server(sender)
+        with smtplib.SMTP(host, port, timeout=20) as server:
             server.starttls()
             server.login(sender, password)
             server.sendmail(sender, [receiver], msg.as_string())

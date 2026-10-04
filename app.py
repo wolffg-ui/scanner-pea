@@ -111,12 +111,24 @@ def latest_price(ticker: str) -> float:
         return 0.0  # repli si le ticker est indisponible
 
 
+def eur_usd_rate() -> float:
+    """Taux EURUSD=X : nombre de USD pour 1 EUR (repli 1.0 si indisponible)."""
+    rate = latest_price("EURUSD=X")
+    return rate if rate > 0 else 1.0
+
+
 def position_value(line: str) -> float:
-    """Valeur actuelle d'une ligne = quantité détenue × dernier prix."""
+    """Valeur actuelle d'une ligne (€) = quantité × dernier prix.
+
+    Les cryptos sont cotées en USD (tickers *-USD) : on convertit en EUR via EURUSD=X.
+    """
     pos = POSITIONS.get(line)
     if not pos:
         return 0.0
-    return pos["qty"] * latest_price(pos["ticker"])
+    value = pos["qty"] * latest_price(pos["ticker"])
+    if line in CRYPTO_LINES:  # prix en USD -> conversion en EUR
+        value /= eur_usd_rate()
+    return value
 
 
 # ----------------------------------------------------------------------------

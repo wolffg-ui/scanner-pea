@@ -7,3 +7,4 @@ __pycache__/
 
 # Secrets Streamlit (ne jamais committer les identifiants réels)
 .streamlit/secrets.toml
+.streamlit/
